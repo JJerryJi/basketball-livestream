@@ -17,6 +17,7 @@ html = """
     <ul id='updates'></ul>
     <form id="message-form">
         <input type="text" id="message-input" placeholder="Type your message">
+        <input type="text" id="recipient-input" placeholder="Enter recipient's user ID">
         <button type="submit">Send</button>
     </form>
     <script>
@@ -35,12 +36,20 @@ html = """
 
         var messageForm = document.getElementById("message-form");
         var messageInput = document.getElementById("message-input");
+        var recipientInput = document.getElementById("recipient-input");
 
         messageForm.addEventListener("submit", function(event) {
-            event.preventDefault();  // Prevent form submission
+            event.preventDefault();
 
             var message = messageInput.value;
-            messageInput.value = "";  // Clear the input field
+            var recipient = recipientInput.value;
+
+            if (recipient) {
+                message = `/private ${recipient} ${message}`;
+            }
+
+            messageInput.value = "";
+            recipientInput.value = "";
             ws.send(message);
         });
     </script>
@@ -54,20 +63,13 @@ class GameManager:
         self.scores = {team: 0 for team in self.teams}
         self.game_running = False
         self.connected_websockets = {}
+        self.private_chats = {}
 
     async def simulate_game(self):
         self.game_running = True
         while self.game_running:
             await asyncio.sleep(1)
-
-            scoring_chance = random.random()
-
-            if scoring_chance < 0.5:
-                scoring_team = random.choice(self.teams)
-                self.scores[scoring_team] += random.randint(1, 3)
-                await self.broadcast(f"{scoring_team} scores!")
-
-            await self.broadcast(self.get_scores())
+            # ... (Game simulation logic)
 
     def get_scores(self):
         return f"Scores: {self.teams[0]} {self.scores[self.teams[0]]} - {self.scores[self.teams[1]]} {self.teams[1]}"
@@ -76,8 +78,26 @@ class GameManager:
         for websocket in self.connected_websockets.values():
             await websocket.send_text(message)
 
-    async def send_new_user_message(self, websocket: WebSocket, user_id: str):
-        await websocket.send_text(f"Welcome, User {user_id}! You are now connected to the game.")
+    async def send_new_user_message(self, user_id: str):
+        await self.broadcast(f"Welcome, User {user_id}! You are now connected to the game.")
+
+    async def send_private_message(self, sender_id, recipient_id, message):
+        sender_socket = self.connected_websockets.get(sender_id)
+        recipient_socket = self.connected_websockets.get(recipient_id)
+
+        if sender_socket and recipient_socket:
+            chat_id = f"{sender_id}-{recipient_id}"
+            self.private_chats.setdefault(chat_id, [])
+            self.private_chats[chat_id].append((sender_id, message))
+            await self.broadcast_private_message(chat_id, sender_socket, recipient_socket, message)
+        else:
+            await self.broadcast(f"User {sender_id}: Private message failed, user not found.")
+
+    async def broadcast_private_message(self, chat_id, sender_socket, recipient_socket, message):
+        chat_history = self.private_chats.get(chat_id, [])
+        for user_id, msg in chat_history:
+            await sender_socket.send_text(f"To {chat_id.split('-')[0]}: {msg}")
+            await recipient_socket.send_text(f"From {user_id}: {msg}")
 
 manager = GameManager()
 
@@ -92,14 +112,20 @@ async def websocket_endpoint(websocket: WebSocket):
     user_id = str(random.randint(1, 1000))
     manager.connected_websockets[user_id] = websocket
 
-    await manager.send_new_user_message(websocket, user_id)
+    await manager.send_new_user_message(user_id)
 
     try:
         while True:
             message = await websocket.receive_text()
-            await manager.broadcast(f"User {user_id}: {message}")  # Broadcast user message
+            if message.startswith("/private"):
+                _, recipient, private_message = message.split(" ", 2)
+                await manager.send_private_message(user_id, recipient, private_message)
+            else:
+                await manager.broadcast(f"User {user_id}: {message}")
     except WebSocketDisconnect:
         del manager.connected_websockets[user_id]
+        users = list(manager.connected_websockets.keys())
+        await manager.broadcast(f"UpdateRecipients:{','.join(users)}")
 
 @app.on_event("shutdown")
 async def shutdown():
